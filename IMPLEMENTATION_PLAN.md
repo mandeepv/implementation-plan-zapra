@@ -263,6 +263,7 @@ DODO_WEBHOOK_SECRET=your_webhook_secret
 # App
 NEXT_PUBLIC_APP_URL=http://localhost:3000
 WORKER_URL=http://localhost:4000
+WORKER_API_KEY=your_secure_random_key_here
 
 # Worker (.env for Railway)
 SUPABASE_URL=same_as_above
@@ -274,6 +275,7 @@ AWS_S3_BUCKET=same_as_above
 OPENAI_API_KEY=same_as_above
 ELEVENLABS_API_KEY=same_as_above
 ELEVENLABS_VOICE_ID=same_as_above
+WORKER_API_KEY=same_as_above
 ```
 
 **Acceptance Criteria:**
@@ -352,6 +354,16 @@ CREATE TABLE webhook_events (
   processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Upload tokens table (short-lived, single-use tokens for extension auth)
+CREATE TABLE upload_tokens (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  token TEXT NOT NULL UNIQUE,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  used BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Indexes for performance
 CREATE INDEX idx_subscriptions_user_id ON subscriptions(user_id);
 CREATE INDEX idx_subscriptions_status ON subscriptions(status);
@@ -360,11 +372,14 @@ CREATE INDEX idx_videos_user_id ON videos(user_id);
 CREATE INDEX idx_videos_status ON videos(status);
 CREATE INDEX idx_videos_created_at ON videos(created_at DESC);
 CREATE INDEX idx_webhook_events_event_id ON webhook_events(event_id);
+CREATE INDEX idx_upload_tokens_token ON upload_tokens(token);
+CREATE INDEX idx_upload_tokens_expires ON upload_tokens(expires_at);
 
 -- Enable Row Level Security
 ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage ENABLE ROW LEVEL SECURITY;
 ALTER TABLE videos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE upload_tokens ENABLE ROW LEVEL SECURITY;
 
 -- RLS Policies for subscriptions
 CREATE POLICY "Users can view their own subscription"
@@ -404,6 +419,20 @@ CREATE POLICY "Users can update their own videos"
 CREATE POLICY "Users can delete their own videos"
   ON videos FOR DELETE
   USING (auth.uid() = user_id);
+
+-- RLS Policies for upload_tokens
+CREATE POLICY "Users can create their own upload tokens"
+  ON upload_tokens FOR INSERT
+  WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can view their own upload tokens"
+  ON upload_tokens FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Service role can manage all tokens (for cleanup and validation)
+CREATE POLICY "Service role can manage upload tokens"
+  ON upload_tokens FOR ALL
+  USING (true);
 
 -- Functions
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -517,6 +546,27 @@ BEGIN
   VALUES (p_user_id, period_start, period_end, 0, 1)
   ON CONFLICT (user_id, period_start)
   DO UPDATE SET videos_exported = usage.videos_exported + 1;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Helper function to refund video quota on permanent failure
+-- Called when a video fails permanently and user gets no usable output
+CREATE OR REPLACE FUNCTION refund_video_quota(p_user_id UUID)
+RETURNS void AS $$
+DECLARE
+  period_start TIMESTAMP WITH TIME ZONE;
+  period_end TIMESTAMP WITH TIME ZONE;
+BEGIN
+  -- Calculate current billing period
+  SELECT s.current_period_start, s.current_period_end
+  INTO period_start, period_end
+  FROM subscriptions s
+  WHERE s.user_id = p_user_id;
+
+  -- Decrement videos_created count (if exists and > 0)
+  UPDATE usage
+  SET videos_created = GREATEST(videos_created - 1, 0)
+  WHERE user_id = p_user_id AND period_start = period_start;
 END;
 $$ LANGUAGE plpgsql;
 ```
@@ -948,6 +998,12 @@ Try to record → Check usage → At limit
 
 #### 4.4 Dodo Payments Integration
 
+**Why Dodo Payments instead of Stripe:**
+- **Geographic restriction:** Stripe is not available in India for new merchant accounts
+- **MVP requirement:** Dodo Payments provides similar functionality with INR support
+- **Migration path:** Can switch to Stripe later if expanding to markets where Stripe is preferred
+- **Note:** Dodo Payments provides standard webhooks, checkout sessions, and subscription management similar to Stripe's API
+
 **API Routes:**
 
 1. `src/app/api/payments/create-checkout/route.ts`
@@ -1375,31 +1431,7 @@ export async function POST() {
 }
 ```
 
-**Add upload_tokens table to Phase 2:**
-
-```sql
--- Upload tokens table (short-lived, single-use)
-CREATE TABLE upload_tokens (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  token TEXT NOT NULL UNIQUE,
-  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-  used BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_upload_tokens_token ON upload_tokens(token);
-CREATE INDEX idx_upload_tokens_expires ON upload_tokens(expires_at);
-
--- Auto-delete expired tokens after 1 hour
-CREATE OR REPLACE FUNCTION delete_expired_upload_tokens()
-RETURNS void AS $$
-BEGIN
-  DELETE FROM upload_tokens
-  WHERE expires_at < NOW() - INTERVAL '1 hour';
-END;
-$$ LANGUAGE plpgsql;
-```
+**Note:** The `upload_tokens` table and indexes are already created in Phase 2 database schema.
 
 **Testing:**
 - [ ] Subscription check works
@@ -1518,6 +1550,13 @@ window.addEventListener('message', (event) => {
       tabId: chrome.devtools?.inspectedWindow?.tabId
     });
   }
+
+  if (event.data.type === 'ZAPRA_LOGOUT') {
+    // Clear all stored user data on logout
+    chrome.storage.local.clear(() => {
+      console.log('Extension: Cleared user data on logout');
+    });
+  }
 });
 
 // Listen from background script
@@ -1547,6 +1586,39 @@ chrome.runtime.onMessage.addListener((message) => {
 - Small floating bar at top of page
 - Shows: Timer, Pause button, Stop button, Delete button
 - Design: `screenshots/11-recording-widget.png`
+
+#### 7.3.1 Logout Integration (Web App → Extension)
+
+**IMPORTANT:** When user logs out, the web app MUST notify the extension to clear stored credentials.
+
+**Implementation in Dashboard Logout Handler:**
+
+Add this to your logout button/function (e.g., in sidebar user profile component):
+
+```typescript
+// src/components/dashboard/UserProfile.tsx (or wherever logout is handled)
+async function handleLogout() {
+  // Notify extension to clear stored data (if extension is installed)
+  window.postMessage({ type: 'ZAPRA_LOGOUT' }, '*');
+
+  // Sign out from Supabase
+  await supabase.auth.signOut();
+
+  // Redirect to login
+  router.push('/login');
+}
+```
+
+**What this does:**
+- Extension content script receives `ZAPRA_LOGOUT` message
+- Clears all chrome.storage.local data (uploadToken, userId)
+- Prevents unauthorized access if same browser/extension is used by different user
+
+**Security note:** This prevents the scenario where:
+1. User A logs in and uses extension (stores credentials)
+2. User A logs out
+3. User B logs in on same browser
+4. User B tries to record → would incorrectly use User A's stale credentials
 
 #### 7.4 Background Script (Recording Logic)
 
@@ -1734,23 +1806,24 @@ export async function POST(request: NextRequest) {
 
     const supabase = createClient();
 
-    // Verify upload token (short-lived, single-use)
-    const { data: tokenData } = await supabase
-      .from('upload_tokens')
-      .select('*, user_id')
-      .eq('token', uploadToken)
-      .eq('used', false)
-      .single();
-
-    if (!tokenData || new Date(tokenData.expires_at) < new Date()) {
-      return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 });
-    }
-
-    // Mark token as used
-    await supabase
+    // Verify upload token (short-lived, single-use) with atomic update to prevent race condition
+    const { data: tokenData, error: tokenError } = await supabase
       .from('upload_tokens')
       .update({ used: true })
-      .eq('token', uploadToken);
+      .eq('token', uploadToken)
+      .eq('used', false) // Only update if not already used (atomic check-and-set)
+      .select('user_id, expires_at')
+      .single();
+
+    // If no rows were updated, token was either already used, doesn't exist, or is invalid
+    if (tokenError || !tokenData) {
+      return NextResponse.json({ error: 'Invalid, expired, or already used token' }, { status: 401 });
+    }
+
+    // Check expiration
+    if (new Date(tokenData.expires_at) < new Date()) {
+      return NextResponse.json({ error: 'Token has expired' }, { status: 401 });
+    }
 
     const userId = tokenData.user_id;
 
@@ -1829,6 +1902,36 @@ export async function POST(request: NextRequest) {
 ```typescript
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import { getPlanLimits } from '@/config/pricing';
+
+/**
+ * Retry helper with exponential backoff for worker API calls
+ * Prevents silent failures when worker temporarily unavailable
+ */
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  delayMs: number = 2000
+): Promise<T> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error as Error;
+      console.error(`[Retry ${attempt}/${maxRetries}] Worker call failed:`, error);
+
+      if (attempt < maxRetries) {
+        const waitTime = delayMs * Math.pow(2, attempt - 1); // Exponential backoff: 2s, 4s, 8s
+        console.log(`[Retry ${attempt}/${maxRetries}] Waiting ${waitTime}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+  }
+
+  throw lastError || new Error('Max retries reached');
+}
 
 export async function POST(
   request: NextRequest,
@@ -1911,11 +2014,23 @@ export async function POST(
       })
       .eq('id', videoId);
 
-    // Queue job on worker
-    await fetch(`${process.env.WORKER_URL}/process`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ videoId }),
+    // Queue job on worker (with authentication + retry logic)
+    // Retry 3 times with exponential backoff (2s, 4s, 8s delays)
+    await retryWithBackoff(async () => {
+      const response = await fetch(`${process.env.WORKER_URL}/process`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-worker-api-key': process.env.WORKER_API_KEY!
+        },
+        body: JSON.stringify({ videoId }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Worker responded with status ${response.status}`);
+      }
+
+      return response;
     });
 
     return NextResponse.json({ success: true, videoId });
@@ -2230,20 +2345,32 @@ export async function GET(
 
 ```typescript
 import express from 'express';
-import { processVideo, retryFailedJobs } from './processor';
+import { processVideo, retryFailedJobs, checkStuckVideos } from './processor';
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
+const WORKER_API_KEY = process.env.WORKER_API_KEY;
 
-// Health check
+// Authentication middleware
+const authenticateWorker = (req, res, next) => {
+  const apiKey = req.headers['x-worker-api-key'];
+
+  if (!apiKey || apiKey !== WORKER_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized - Invalid API key' });
+  }
+
+  next();
+};
+
+// Health check (no auth required)
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// Process video endpoint
-app.post('/process', async (req, res) => {
+// Process video endpoint (requires authentication)
+app.post('/process', authenticateWorker, async (req, res) => {
   const { videoId } = req.body;
 
   if (!videoId) {
@@ -2269,6 +2396,47 @@ setInterval(() => {
 
 // Run once on startup
 retryFailedJobs().catch(console.error);
+
+// STUCK VIDEO POLLER: Run every 30 seconds to catch silent worker failures
+setInterval(() => {
+  checkStuckVideos().catch(console.error);
+}, 30 * 1000); // 30 seconds
+
+// Run once on startup
+checkStuckVideos().catch(console.error);
+```
+
+#### 9.2.5 Worker Configuration
+
+**File:** `worker/src/config.ts`
+
+**IMPORTANT:** Duplicate plan configuration to avoid broken import path when worker is deployed separately.
+
+```typescript
+/**
+ * Plan limits configuration for worker
+ *
+ * CRITICAL: This is duplicated from src/config/pricing.ts to avoid import issues
+ * when worker runs in separate deployment. Keep these values in sync!
+ *
+ * If you update plan limits in the main app, update them here too.
+ */
+export const PLANS = {
+  pro: {
+    monthlyVideos: 50,
+    maxVideoDuration: 15 * 60, // 15 minutes in seconds
+  },
+  scale: {
+    monthlyVideos: 300,
+    maxVideoDuration: 30 * 60, // 30 minutes in seconds
+  },
+} as const;
+
+export type PlanId = keyof typeof PLANS;
+
+export function getPlanLimits(planId: PlanId) {
+  return PLANS[planId];
+}
 ```
 
 #### 9.3 Video Processor
@@ -2283,7 +2451,7 @@ import { downloadFromS3, uploadToS3 } from './s3';
 import { extractAudio, replaceAudio, extractThumbnail, getVideoDuration, syncAudioToVideo, getAudioDuration } from './ffmpeg';
 import { transcribeAudio } from './whisper';
 import { generateVoice } from './elevenlabs';
-import { getPlanLimits } from '../../src/config/pricing'; // Import from main app
+import { getPlanLimits } from './config'; // Use local worker config
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -2358,7 +2526,9 @@ export async function processVideo(videoId: string): Promise<void> {
 
     // Download original video
     const videoPath = path.join(tempDir, 'original.webm');
-    await downloadFromS3(video.original_video_url, videoPath);
+    // Extract S3 key from URL: https://bucket.s3.region.amazonaws.com/key -> key
+    const s3Key = new URL(video.original_video_url).pathname.slice(1); // Remove leading /
+    await downloadFromS3(s3Key, videoPath);
 
     // Get duration
     const duration = await getVideoDuration(videoPath);
@@ -2482,9 +2652,17 @@ export async function processVideo(videoId: string): Promise<void> {
       setTimeout(() => processVideo(videoId), delay);
 
     } else {
-      // Max retries reached - mark as failed
-      console.error(`[${videoId}] Max retries reached, marking as failed`);
+      // Max retries reached - mark as failed AND refund quota
+      console.error(`[${videoId}] Max retries reached, marking as failed and refunding quota`);
 
+      // Get video to retrieve user_id
+      const { data: failedVideo } = await supabase
+        .from('videos')
+        .select('user_id')
+        .eq('id', videoId)
+        .single();
+
+      // Mark video as failed
       await supabase
         .from('videos')
         .update({
@@ -2493,6 +2671,12 @@ export async function processVideo(videoId: string): Promise<void> {
           updated_at: new Date().toISOString(),
         })
         .eq('id', videoId);
+
+      // Refund quota since user got no usable output
+      if (failedVideo?.user_id) {
+        console.log(`[${videoId}] Refunding quota for user ${failedVideo.user_id}`);
+        await supabase.rpc('refund_video_quota', { p_user_id: failedVideo.user_id });
+      }
     }
 
   } finally {
@@ -2541,6 +2725,53 @@ export async function retryFailedJobs() {
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
 }
+
+/**
+ * Check for stuck videos (videos in 'processing' status for >5 minutes)
+ * Run this every 30 seconds to catch silent worker failures
+ */
+export async function checkStuckVideos() {
+  console.log('[Stuck Video Check] Checking for stuck videos...');
+
+  // Find videos stuck in 'processing' for more than 5 minutes
+  const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+  const { data: stuckVideos } = await supabase
+    .from('videos')
+    .select('*')
+    .eq('status', 'processing')
+    .lt('updated_at', fiveMinutesAgo)
+    .lt('retry_count', 3)
+    .order('updated_at', { ascending: true })
+    .limit(10); // Process 10 at a time
+
+  if (!stuckVideos || stuckVideos.length === 0) {
+    console.log('[Stuck Video Check] No stuck videos found');
+    return;
+  }
+
+  console.log(`[Stuck Video Check] Found ${stuckVideos.length} stuck videos, reprocessing...`);
+
+  for (const video of stuckVideos) {
+    console.log(`[Stuck Video Check] Reprocessing video ${video.id} (stuck since ${video.updated_at})`);
+
+    // Update retry count and status
+    await supabase
+      .from('videos')
+      .update({
+        status: 'processing',
+        retry_count: video.retry_count + 1,
+        updated_at: new Date().toISOString(), // Update timestamp to prevent re-polling
+      })
+      .eq('id', video.id);
+
+    // Queue for processing
+    processVideo(video.id).catch(console.error);
+
+    // Small delay between retries to avoid overwhelming system
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+}
 ```
 
 #### 9.4 FFmpeg Utilities
@@ -2553,6 +2784,7 @@ export async function retryFailedJobs() {
 import ffmpeg from 'fluent-ffmpeg';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 
 /**
  * Sanitize and validate file paths to prevent shell injection
@@ -2567,10 +2799,11 @@ function validateFilePath(filePath: string): string {
   // Ensure path is absolute and normalized
   const normalized = path.normalize(path.resolve(filePath));
 
-  // Prevent path traversal (must stay within temp dir or allowed dirs)
-  const tempDir = path.resolve(path.join(process.cwd(), 'tmp'));
+  // Prevent path traversal (must stay within OS temp dir)
+  // IMPORTANT: This must match where processor.ts creates temp directories (os.tmpdir())
+  const tempDir = path.resolve(os.tmpdir());
   if (!normalized.startsWith(tempDir)) {
-    throw new Error(`Invalid file path: outside allowed directory`);
+    throw new Error(`Invalid file path: outside allowed directory (${tempDir})`);
   }
 
   return normalized;
@@ -2898,7 +3131,7 @@ export async function generateVoice(text: string, outputPath: string): Promise<v
 **File:** `worker/src/s3.ts`
 
 ```typescript
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import fs from 'fs';
 
 const s3 = new S3Client({
@@ -2911,10 +3144,26 @@ const s3 = new S3Client({
 
 const BUCKET = process.env.AWS_S3_BUCKET!;
 
-export async function downloadFromS3(url: string, outputPath: string): Promise<void> {
-  const response = await fetch(url);
-  const buffer = await response.arrayBuffer();
-  fs.writeFileSync(outputPath, Buffer.from(buffer));
+/**
+ * Download file from S3 using credentials (not public URL)
+ * IMPORTANT: Cannot use fetch() because bucket policy forbids public GET
+ */
+export async function downloadFromS3(s3Key: string, outputPath: string): Promise<void> {
+  const command = new GetObjectCommand({
+    Bucket: BUCKET,
+    Key: s3Key,
+  });
+
+  const response = await s3.send(command);
+
+  // Convert readable stream to buffer
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of response.Body as any) {
+    chunks.push(chunk);
+  }
+  const buffer = Buffer.concat(chunks);
+
+  fs.writeFileSync(outputPath, buffer);
 }
 
 export async function uploadToS3(buffer: Buffer, key: string, contentType: string): Promise<string> {
@@ -3031,10 +3280,16 @@ restartPolicyType = "on-failure"
 **Purpose:** Show animated loading state while video processes (~2-3 minutes)
 
 **Logic:**
-- Poll database every 3 seconds for video status
+- Subscribe to real-time updates from Supabase for instant status changes (no polling!)
 - If status = 'completed', redirect to result page
 - If status = 'failed', show error message
 - If no audio detected error, show specific message: "No audio detected. Please re-record with voice narration."
+
+**Benefits of Real-time vs Polling:**
+- ✅ Instant updates (0ms vs 3s delay)
+- ✅ 99% less database load (1 query vs continuous polling)
+- ✅ Better UX (user sees completion immediately)
+- ✅ Free (included in Supabase)
 
 **Implementation:**
 
@@ -3045,14 +3300,19 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { ProcessingAnimation } from '@/components/video/ProcessingAnimation';
+import { RealtimeChannel } from '@supabase/supabase-js';
 
 export default function ProcessingPage({ params }: { params: { id: string } }) {
   const router = useRouter();
   const supabase = createClient();
   const [error, setError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
-    const pollStatus = async () => {
+    let channel: RealtimeChannel;
+
+    // Initial status check
+    const checkInitialStatus = async () => {
       const { data: video } = await supabase
         .from('videos')
         .select('status, error_message, retry_count')
@@ -3064,14 +3324,41 @@ export default function ProcessingPage({ params }: { params: { id: string } }) {
       } else if (video?.status === 'failed') {
         setError(video.error_message || 'Processing failed');
         setRetryCount(video.retry_count || 0);
-        clearInterval(interval);
       }
     };
 
-    const interval = setInterval(pollStatus, 3000);
-    pollStatus(); // Initial check
+    checkInitialStatus();
 
-    return () => clearInterval(interval);
+    // Subscribe to real-time updates for this specific video
+    channel = supabase
+      .channel(`video-${params.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'videos',
+          filter: `id=eq.${params.id}`
+        },
+        (payload) => {
+          const updatedVideo = payload.new as { status: string; error_message?: string; retry_count?: number };
+
+          if (updatedVideo.status === 'completed') {
+            // Video processing complete - redirect to result page
+            router.push(`/content/${params.id}`);
+          } else if (updatedVideo.status === 'failed') {
+            // Video processing failed - show error
+            setError(updatedVideo.error_message || 'Processing failed');
+            setRetryCount(updatedVideo.retry_count || 0);
+          }
+        }
+      )
+      .subscribe();
+
+    // Cleanup subscription on unmount
+    return () => {
+      channel.unsubscribe();
+    };
   }, [params.id, router, supabase]);
 
   if (error) {
@@ -3447,7 +3734,32 @@ railway up
 railway domain
 ```
 
-Update Vercel env var: `WORKER_URL=https://your-worker.up.railway.app`
+**Set environment variables on Railway:**
+```bash
+# Generate a secure random API key first
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+# Set all environment variables on Railway
+railway variables set SUPABASE_URL=your_supabase_url
+railway variables set SUPABASE_SERVICE_KEY=your_service_key
+railway variables set AWS_ACCESS_KEY_ID=your_aws_key
+railway variables set AWS_SECRET_ACCESS_KEY=your_aws_secret
+railway variables set AWS_REGION=us-east-1
+railway variables set AWS_S3_BUCKET=zapra-videos
+railway variables set OPENAI_API_KEY=your_openai_key
+railway variables set ELEVENLABS_API_KEY=your_elevenlabs_key
+railway variables set ELEVENLABS_VOICE_ID=your_voice_id
+railway variables set WORKER_API_KEY=<the_random_key_generated_above>
+```
+
+**Update Vercel environment variables:**
+```bash
+# In Vercel dashboard, add/update:
+WORKER_URL=https://your-worker.up.railway.app
+WORKER_API_KEY=<same_key_as_railway>
+```
+
+**IMPORTANT:** The `WORKER_API_KEY` must be identical on both Railway and Vercel!
 
 #### 11.3 AWS S3 Configuration
 
@@ -3491,12 +3803,17 @@ aws s3api put-bucket-cors --bucket zapra-videos --cors-configuration file://cors
 - Only allow necessary HTTP methods (GET, PUT, HEAD)
 - Restrict origins to production domains + localhost + Chrome extension
 - Limit allowed headers to those needed for uploads
-- **IMPORTANT - Extension CORS Security:**
-  - `chrome-extension://*` is used during development when the extension ID is unstable
-  - **After publishing to Chrome Web Store:** Replace `chrome-extension://*` with the specific extension ID: `chrome-extension://YOUR_ACTUAL_EXTENSION_ID`
-  - The wildcard `*` opens your S3 bucket to ALL Chrome extensions, which is a security risk in production
-  - Get your stable extension ID from Chrome Web Store after approval: https://chrome.google.com/webstore/developer/dashboard
-  - Update cors.json and reapply: `aws s3api put-bucket-cors --bucket zapra-videos --cors-configuration file://cors.json`
+- **CRITICAL - Extension CORS Security:**
+  - **For MVP testing:** `chrome-extension://*` wildcard is acceptable during development
+  - **MUST FIX before public launch:** After Chrome Web Store approval, immediately replace `chrome-extension://*` with your specific extension ID
+  - Example: `chrome-extension://abcdefghijklmnopqrstuvwxyz123456`
+  - Get your stable extension ID from: https://chrome.google.com/webstore/developer/dashboard
+  - **Why this matters:** The wildcard `*` allows ALL Chrome extensions (including malicious ones) to upload to your S3 bucket
+  - **Update steps:**
+    1. Get extension ID from Chrome Web Store dashboard
+    2. Update `cors.json` with specific ID
+    3. Reapply: `aws s3api put-bucket-cors --bucket zapra-videos --cors-configuration file://cors.json`
+  - **Timeline:** Update within 24 hours of Chrome Web Store approval
 
 **Set S3 Bucket Policy (prevent public access):**
 
@@ -3752,18 +4069,26 @@ zip -r zapra-extension.zip * -x "*.DS_Store"
 | Railway Worker | $5-10/month |
 | Supabase Pro (optional, Free tier may suffice) | $25/month or $0 |
 | AWS S3 Storage (500GB) | $11.50/month |
-| AWS S3 Data Transfer (50GB/month) | $4.50/month |
+| AWS S3 Data Transfer (realistic: 200GB/month) | $18/month |
 | OpenAI Whisper (5 min avg, 1000 videos) | $30/month |
 | ElevenLabs (1000 videos) | $100/month |
 | Domain (.ai domain) | $2-10/month |
-| **Total (with Supabase Free)** | **~$171-180/month** |
-| **Total (with Supabase Pro)** | **~$196-205/month** |
+| **Total (with Supabase Free)** | **~$185-195/month** |
+| **Total (with Supabase Pro)** | **~$210-220/month** |
+
+**Bandwidth Calculation Details:**
+- Average processed video: 80MB (5 min @ 2.5 Mbps H.264)
+- Downloads per video: 2.5x (testing, re-downloads, sharing)
+- Total transfer: 1000 videos × 80MB × 2.5 = 200GB/month
+- Cost: 200GB × $0.09/GB = $18/month
+- **Note:** Can spike to $30-40/month with heavy usage
 
 **Per-Video Processing Cost:** ~$0.13 (Whisper $0.03 + ElevenLabs $0.10)
 
 **Break-even Analysis:**
 - If 5 Pro users ($49 × 5 = $245/month) → Profitable
 - If 1 Scale user ($249/month) → Profitable
+- **Margins remain healthy even with realistic bandwidth costs**
 
 ### B. Timeline Summary
 
@@ -3780,9 +4105,14 @@ zip -r zapra-extension.zip * -x "*.DS_Store"
 | 9 | Railway Worker | 6-8 hours |
 | 10 | Video Pages | 3-4 hours |
 | 11 | Deployment | 3-4 hours |
-| **Total** | | **37-49 hours** |
+| **Subtotal (Dev Time)** | | **37-49 hours** |
+| **Buffer (Debugging & Testing)** | +50% | **+19-25 hours** |
+| **Realistic Total** | | **60-80 hours** |
 
-**Timeline:** 5-7 days for 1 developer, 3-4 days for 2 developers working in parallel
+**Realistic Timeline:**
+- **1 developer:** 8-10 days (assuming 8-hour workdays)
+- **2 developers:** 5-6 days working in parallel
+- **Note:** Original estimate assumed perfect implementation with zero bugs. Realistic estimate includes debugging, testing, and fixes.
 
 ### C. Features for Later (Post-MVP)
 
